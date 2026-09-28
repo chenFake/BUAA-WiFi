@@ -1,0 +1,138 @@
+bash <<'EOF'
+set -u
+
+SSID="BUAA-WiFi"
+
+# 修改为目标设备 MAC
+TARGET_MAC="50:92:6a:xx:xx:xx"
+
+CONN="BUAA-IOT-TEMP"
+
+IFACE=$(nmcli -t -f DEVICE,TYPE device status |
+    awk -F: '$2=="wifi"{print $1; exit}')
+
+if [ -z "$IFACE" ]; then
+    echo "未找到 Wi-Fi 网卡。"
+    exit 1
+fi
+
+ORIGINAL_MAC=$(cat "/sys/class/net/$IFACE/address")
+
+cleanup() {
+    echo
+    echo "正在恢复电脑网络状态……"
+
+    sudo nmcli connection down "$CONN" 2>/dev/null || true
+    sudo nmcli connection delete "$CONN" 2>/dev/null || true
+
+    sudo ip link set "$IFACE" down 2>/dev/null || true
+    sudo ip link set "$IFACE" address "$ORIGINAL_MAC" 2>/dev/null || true
+    sudo ip link set "$IFACE" up 2>/dev/null || true
+
+    sleep 2
+
+    echo "当前电脑 MAC："
+    cat "/sys/class/net/$IFACE/address"
+}
+
+trap cleanup EXIT INT TERM
+
+echo "无线接口：$IFACE"
+echo "电脑原 MAC：$ORIGINAL_MAC"
+echo "目标 MAC：$TARGET_MAC"
+
+# 关闭代理
+gsettings set org.gnome.system.proxy mode 'none' 2>/dev/null || true
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
+
+# 清除旧临时配置
+sudo nmcli connection down "$CONN" 2>/dev/null || true
+sudo nmcli connection delete "$CONN" 2>/dev/null || true
+sudo nmcli device disconnect "$IFACE" 2>/dev/null || true
+
+sleep 2
+
+# 创建 BUAA-WiFi 连接
+sudo nmcli connection add \
+    type wifi \
+    ifname "$IFACE" \
+    con-name "$CONN" \
+    ssid "$SSID"
+
+# 克隆目标设备 MAC
+sudo nmcli connection modify "$CONN" \
+    802-11-wireless.cloned-mac-address "$TARGET_MAC"
+
+sudo nmcli connection modify "$CONN" \
+    ipv4.method auto \
+    ipv6.method auto \
+    connection.autoconnect no
+
+# 连接 BUAA-WiFi
+sudo nmcli connection up "$CONN" ifname "$IFACE"
+
+sleep 5
+
+ACTUAL_MAC=$(cat "/sys/class/net/$IFACE/address")
+IPV4=$(ip -4 -o addr show "$IFACE" |
+    awk '{print $4}' |
+    head -1)
+
+echo
+echo "当前 MAC：$ACTUAL_MAC"
+echo "目标 MAC：$TARGET_MAC"
+echo "IPv4：${IPV4:-未获得}"
+
+if [ "${ACTUAL_MAC,,}" != "${TARGET_MAC,,}" ]; then
+    echo "MAC 克隆失败，请勿继续认证。"
+    exit 1
+fi
+
+if [ -z "$IPV4" ]; then
+    echo "未获得 IPv4 地址，请勿继续认证。"
+    exit 1
+fi
+
+echo
+echo "MAC 克隆和 DHCP 均成功。"
+
+curl --noproxy '*' \
+    -I \
+    --max-time 5 \
+    http://gw.buaa.edu.cn \
+    2>/dev/null |
+    head -10 || true
+
+echo
+echo "请打开浏览器访问："
+echo "https://gw.buaa.edu.cn"
+echo
+echo "完成校园网认证并确认可以正常访问互联网。"
+
+xdg-open "https://gw.buaa.edu.cn" >/dev/null 2>&1 &
+
+read -r -p \
+"确认已经认证并可以正常上网后输入 YES：" \
+OK </dev/tty
+
+if [ "$OK" != "YES" ]; then
+    echo "未确认认证成功，本次操作结束。"
+    exit 0
+fi
+
+if curl --noproxy '*' \
+        -I \
+        --max-time 8 \
+        https://www.baidu.com \
+        >/dev/null 2>&1
+then
+    echo "互联网连接正常。"
+else
+    echo "互联网测试失败，请检查认证状态。"
+fi
+
+echo
+echo "即将断开临时连接并恢复电脑原 MAC。"
+echo "脚本结束后等待约 10 秒，再启动 IoT 设备。"
+
+EOF
